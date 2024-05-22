@@ -3,7 +3,10 @@ from torch_geometric.loader import DataLoader
 import torch.optim as optim
 import torch.nn.functional as F
 from gnn import GNN, GNN_CBM
-
+import dgl
+import torch
+from torch_geometric.data import Data
+from functools import reduce
 
 from tqdm import tqdm
 import argparse
@@ -77,6 +80,52 @@ def eval(model, device, loader, evaluator):
 
     return evaluator.eval(input_dict)
 
+def dgl_to_pyg(dgl_graph):
+    # Extract node features (if available)
+    node_features = dgl_graph.ndata['attr'] if 'attr' in dgl_graph.ndata else None
+
+    # Extract edge indices
+    src, dst = dgl_graph.edges()
+    edge_index = torch.stack([src, dst], dim=0)
+
+    # Extract edge features (if available)
+    edge_features = dgl_graph.edata['edge_attr'] if 'edge_attr' in dgl_graph.edata else None
+
+    # Create PyG Data object
+    pyg_graph = Data(x=node_features, edge_index=edge_index, edge_attr=edge_features)
+
+    return pyg_graph
+
+def merge_pyg_graphs(graph1, graph2):
+    # Concatenate node features
+    if graph1.x is not None and graph2.x is not None:
+        node_features = torch.cat([graph1.x, graph2.x], dim=0)
+    else:
+        node_features = None
+
+    # Concatenate edge indices, adjusting the indices of the second graph
+    edge_index2 = graph2.edge_index + graph1.num_nodes
+    edge_index = torch.cat([graph1.edge_index, edge_index2], dim=1)
+
+    # Concatenate edge features
+    if graph1.edge_attr is not None and graph2.edge_attr is not None:
+        edge_features = torch.cat([graph1.edge_attr, graph2.edge_attr], dim=0)
+    else:
+        edge_features = None
+
+    # Create a new PyG Data object with the merged features
+    merged_graph = Data(x=node_features, edge_index=edge_index, edge_attr=edge_features)
+
+    return merged_graph
+
+def add_attributes(dataset):
+    data_list = []
+    for i, data in enumerate(dataset):
+        #print(torch.from_numpy(concept_value_llm[i]).shape)
+        data.concept = torch.from_numpy(concept_value_llm[i])
+        data_list.append(data)
+    dataset.data, dataset.slices = dataset.collate(data_list)
+    return dataset
 
 def main():
     # Training settings
@@ -144,15 +193,22 @@ def main():
 
 
     ### automatic dataloading and splitting
-    dataset = PygGraphPropPredDataset(name = args.dataset)
-    def add_attributes(dataset):
-        data_list = []
-        for i, data in enumerate(dataset):
-            #print(torch.from_numpy(concept_value_llm[i]).shape)
-            data.concept = torch.from_numpy(concept_value_llm[i])
-            data_list.append(data)
-        dataset.data, dataset.slices = dataset.collate(data_list)
-        return dataset
+    if args.dataset in ["bh", "suzuki"]:
+        data = GraphDataset(data_id, split_id)
+        dataset = []
+        for reaction in data:
+            pyg_graph_list = []
+            for dgl_graph in reaction[:-1]:
+                pyg_graph = dgl_to_pyg(dgl_graph)
+                pyg_graph_list.append(pyg_graph)
+
+            g = reduce(merge_pyg_graphs, pyg_graph_list)
+            g.y = torch.tensor(reaction[-1]).view(1,1)
+            dataset.append(g)
+        split_idx = 
+    else:
+        dataset = PygGraphPropPredDataset(name = args.dataset)
+        split_idx = dataset.get_idx_split()
     
     dataset = add_attributes(dataset)
 
@@ -164,7 +220,6 @@ def main():
         dataset.data.x = dataset.data.x[:,:2]
         dataset.data.edge_attr = dataset.data.edge_attr[:,:2]
 
-    split_idx = dataset.get_idx_split()
 
     ### automatic evaluator. takes dataset name as input
     evaluator = Evaluator(args.dataset)
